@@ -2,11 +2,12 @@ import { useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Users } from 'lucide-react';
 import EmailManagement from '../components/EmailManagement';
+import About from '../components/About';
 import { ModeToggle } from '../components/mode-toggle';
 import type { EmailAccount } from '../types';
 
 export default function Dashboard() {
-    const [view, setView] = useState<'dashboard' | 'management'>('dashboard');
+    const [view, setView] = useState<'dashboard' | 'management' | 'about'>('dashboard');
     const [accounts, setAccounts] = useState<EmailAccount[]>([]);
 
     useEffect(() => {
@@ -50,6 +51,13 @@ export default function Dashboard() {
                     >
                         账号管理
                     </button>
+                    <button
+                        className={`pill-nav-item ${view === 'about' ? 'active' : ''}`}
+                        onClick={() => setView('about')}
+                        type="button"
+                    >
+                        关于
+                    </button>
                 </nav>
 
                 <div className="header-right-actions">
@@ -74,9 +82,13 @@ export default function Dashboard() {
                             </div>
                         </div>
                     </div>
-                ) : (
+                ) : view === 'management' ? (
                     <div className="h-full overflow-auto p-6">
                         <EmailManagement />
+                    </div>
+                ) : (
+                    <div className="h-full overflow-auto p-6">
+                        <About />
                     </div>
                 )}
             </main>

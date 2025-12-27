@@ -225,7 +225,7 @@ button {
   cursor: pointer;
   font-family: inherit;
   border: none;
-  background: none;
+  /* background: none; 移除此行，避免覆盖 Tailwind 的 bg-* 类 */
 }
 
 /* Animations */

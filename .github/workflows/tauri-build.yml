@@ -51,9 +51,11 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: v__VERSION__
-          releaseName: 'Firemail v__VERSION__'
+          releaseName: 'FlareMail v__VERSION__'
           releaseBody: '请下载对应平台的安装包：\n- Windows: .msi 或 .exe\n- macOS: .dmg\n- Linux: .deb 或 .AppImage'
           releaseDraft: true
           prerelease: false
