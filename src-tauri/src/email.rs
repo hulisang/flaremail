@@ -155,6 +155,7 @@ pub struct TokenRefreshResult {
 }
 
 /// 收件用邮箱信息
+#[allow(dead_code)]
 #[derive(sqlx::FromRow)]
 struct OutlookAccount {
     id: i64,
