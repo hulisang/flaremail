@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { LayoutDashboard, Users, Mail } from 'lucide-react';
+import { Users, Mail } from 'lucide-react';
 import EmailManagement from '../components/EmailManagement';
 import { ModeToggle } from '../components/mode-toggle';
 import type { EmailAccount } from '../types';
@@ -10,7 +10,9 @@ export default function Dashboard() {
     const [accounts, setAccounts] = useState<EmailAccount[]>([]);
 
     useEffect(() => {
-        // 初次进入时加载邮箱列表
+        // 切换到仪表盘视图时加载邮箱列表
+        if (view !== 'dashboard') return;
+
         const loadAccounts = async () => {
             try {
                 const list = await invoke<EmailAccount[]>('get_emails');
@@ -21,42 +23,39 @@ export default function Dashboard() {
         };
 
         loadAccounts();
-    }, []);
+    }, [view]);
 
     const accountCount = accounts.length;
 
     return (
         <div className="flex h-screen bg-background text-foreground overflow-hidden">
             {/* 顶部导航 */}
-            <header className="absolute top-0 left-0 right-0 h-16 border-b bg-background/95 backdrop-blur z-50 flex items-center justify-between px-6">
-                <div className="flex items-center gap-2 font-bold text-xl select-none">
-                    <div className="p-2 rounded-lg bg-primary/10 text-primary">
-                        <Mail size={20} />
-                    </div>
-                    FireMail
+            <header className="top-header">
+                <div className="header-logo">
+                    <Mail size={18} className="text-primary" />
+                    FlareMail
                 </div>
 
-                <nav className="flex items-center gap-2">
+                <nav className="pill-nav-container">
                     <button
-                        className={`flex items-center gap-2 px-4 py-2 rounded-md text-sm font-medium transition-colors ${view === 'dashboard' ? 'bg-secondary text-secondary-foreground' : 'text-muted-foreground hover:bg-secondary/50'}`}
+                        className={`pill-nav-item ${view === 'dashboard' ? 'active' : ''}`}
                         onClick={() => setView('dashboard')}
                         type="button"
                     >
-                        <LayoutDashboard size={16} />
                         仪表盘
                     </button>
                     <button
-                        className={`flex items-center gap-2 px-4 py-2 rounded-md text-sm font-medium transition-colors ${view === 'management' ? 'bg-secondary text-secondary-foreground' : 'text-muted-foreground hover:bg-secondary/50'}`}
+                        className={`pill-nav-item ${view === 'management' ? 'active' : ''}`}
                         onClick={() => setView('management')}
                         type="button"
                     >
-                        <Users size={16} />
-                        邮箱管理
+                        账号管理
                     </button>
-                    <div className="ml-2 pl-2 border-l">
-                        <ModeToggle />
-                    </div>
                 </nav>
+
+                <div className="header-right-actions">
+                    <ModeToggle />
+                </div>
             </header>
 
             {/* 主内容 */}

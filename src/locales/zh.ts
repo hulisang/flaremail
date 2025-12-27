@@ -4,7 +4,7 @@ export const zh = {
         title: "菜单",
         inbox: "收件箱",
         mailList: "邮件列表",
-        trash: "垃圾箱",
+        trash: "垃圾邮件",
         apps: "应用",
         settings: {
             title: "设置",

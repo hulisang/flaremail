@@ -65,8 +65,10 @@ pub async fn delete_email(state: State<'_, AppState>, email_id: i64) -> Result<b
 pub async fn check_outlook_email(
     state: State<'_, AppState>,
     email_id: i64,
+    folder: Option<String>,
 ) -> Result<CheckResult, String> {
-    match email::check_outlook_email(&state.db, email_id).await {
+    let folder = folder.unwrap_or_else(|| "INBOX".to_string());
+    match email::check_outlook_email(&state.db, email_id, &folder).await {
         Ok(result) => Ok(result),
         Err(e) => Err(format!("收件失败: {}", e)),
     }
@@ -77,8 +79,10 @@ pub async fn check_outlook_email(
 pub async fn batch_check_outlook_emails(
     state: State<'_, AppState>,
     email_ids: Vec<i64>,
+    folder: Option<String>,
 ) -> Result<BatchCheckResult, String> {
-    match email::batch_check_outlook_emails(&state.db, email_ids).await {
+    let folder = folder.unwrap_or_else(|| "INBOX".to_string());
+    match email::batch_check_outlook_emails(&state.db, email_ids, &folder).await {
         Ok(result) => Ok(result),
         Err(e) => Err(format!("批量收件失败: {}", e)),
     }

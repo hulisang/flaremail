@@ -6,6 +6,8 @@ export interface User {
 export interface EmailAccount {
     id: number;
     email: string;
+    // 邮箱密码（仅前端显示/复制使用）
+    password: string;
     mail_type: string;
     client_id: string;
     refresh_token: string;

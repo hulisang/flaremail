@@ -7,7 +7,7 @@ use mailparse::{DispositionType, MailHeaderMap, ParsedMail};
 use native_tls::TlsConnector;
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use crate::graph_api;
@@ -15,7 +15,7 @@ use crate::proxy::{create_http_client, ProxyConfig};
 use crate::token_cache;
 
 /// API 模式
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ApiMode {
     /// 自动选择：根据 Token 权限自动判断使用 Graph API 还是 IMAP
@@ -49,6 +49,8 @@ impl From<Option<String>> for ApiMode {
 pub struct EmailAccount {
     pub id: i64,
     pub email: String,
+    /// 邮箱密码（前端显示/复制使用）
+    pub password: String,
     pub mail_type: String,
     pub client_id: String,
     pub refresh_token: String,
@@ -270,7 +272,11 @@ pub async fn import_emails_batch(pool: &Pool<Sqlite>, input: &str) -> Result<Imp
         let client_id = parts[2].trim();
         let refresh_token = parts[3].trim();
 
-        if email.is_empty() || password.is_empty() || client_id.is_empty() || refresh_token.is_empty() {
+        if email.is_empty()
+            || password.is_empty()
+            || client_id.is_empty()
+            || refresh_token.is_empty()
+        {
             failed_count += 1;
             failed_lines.push(format!("第 {} 行: 存在空字段", line_no + 1));
             continue;
@@ -299,7 +305,7 @@ pub async fn import_emails_batch(pool: &Pool<Sqlite>, input: &str) -> Result<Imp
 /// 获取邮箱列表
 pub async fn get_emails(pool: &Pool<Sqlite>) -> Result<Vec<EmailAccount>> {
     let emails = sqlx::query_as::<_, EmailAccount>(
-        "SELECT id, email, mail_type, client_id, refresh_token, last_check_time, api_mode, proxy_type, proxy_url, default_folder FROM emails ORDER BY created_at DESC",
+        "SELECT id, email, password, mail_type, client_id, refresh_token, last_check_time, api_mode, proxy_type, proxy_url, default_folder FROM emails ORDER BY created_at DESC",
     )
     .fetch_all(pool)
     .await?;
@@ -342,7 +348,10 @@ pub async fn get_attachments(pool: &Pool<Sqlite>, mail_id: i64) -> Result<Vec<At
 }
 
 /// 获取附件内容
-pub async fn get_attachment_content(pool: &Pool<Sqlite>, attachment_id: i64) -> Result<AttachmentContent> {
+pub async fn get_attachment_content(
+    pool: &Pool<Sqlite>,
+    attachment_id: i64,
+) -> Result<AttachmentContent> {
     let row = sqlx::query_as::<_, (i64, Option<String>, Option<String>, Vec<u8>)>(
         "SELECT id, filename, content_type, content FROM attachments WHERE id = ?",
     )
@@ -359,9 +368,16 @@ pub async fn get_attachment_content(pool: &Pool<Sqlite>, attachment_id: i64) -> 
 }
 
 /// Outlook 单邮箱收件（增强版：支持 Token 缓存、代理、Graph API）
-pub async fn check_outlook_email(pool: &Pool<Sqlite>, email_id: i64) -> Result<CheckResult> {
+pub async fn check_outlook_email(
+    pool: &Pool<Sqlite>,
+    email_id: i64,
+    folder: &str,
+) -> Result<CheckResult> {
     let account = get_outlook_account(pool, email_id).await?;
-    let mail_type = account.mail_type.clone().unwrap_or_else(|| "outlook".to_string());
+    let mail_type = account
+        .mail_type
+        .clone()
+        .unwrap_or_else(|| "outlook".to_string());
     if mail_type != "outlook" {
         return Err(anyhow!("仅支持 outlook 收件"));
     }
@@ -372,11 +388,8 @@ pub async fn check_outlook_email(pool: &Pool<Sqlite>, email_id: i64) -> Result<C
     // 获取配置的 API 模式
     let configured_mode = ApiMode::from(account.api_mode.clone());
 
-    // 获取文件夹
-    let folder = account
-        .default_folder
-        .clone()
-        .unwrap_or_else(|| "INBOX".to_string());
+    // 使用传入的 folder 参数
+    let folder = folder.to_string();
 
     // 尝试从缓存获取 Token，如果没有则刷新并检测权限
     let (access_token, api_mode) = match token_cache::get_valid_token(pool, email_id).await? {
@@ -398,21 +411,15 @@ pub async fn check_outlook_email(pool: &Pool<Sqlite>, email_id: i64) -> Result<C
                 .await?;
             update_email_token(pool, account.id, &result.access_token).await?;
 
-            // 自动选择 API 模式：
-            // - 如果配置为 auto，则根据 Mail.Read 权限自动选择
-            // - 如果配置为特定模式，则使用配置的模式
-            let actual_mode = match configured_mode {
-                ApiMode::Auto => {
-                    if result.supports_graph {
-                        log::info!("检测到 Mail.Read 权限，自动使用 Graph API 模式");
-                        ApiMode::Graph
-                    } else {
-                        log::info!("未检测到 Mail.Read 权限，自动使用 IMAP 模式");
-                        ApiMode::Imap
-                    }
-                }
-                mode => mode,
+            // 根据权限自动选择协议（借鉴 MS_OAuth2API_Next）
+            let actual_mode = if result.supports_graph {
+                log::info!("检测到 Mail.Read 权限，自动使用 Graph API 模式");
+                ApiMode::Graph
+            } else {
+                log::info!("未检测到 Mail.Read 权限，自动使用 IMAP 模式");
+                ApiMode::Imap
             };
+            update_email_api_mode(pool, account.id, actual_mode).await?;
 
             (result.access_token, actual_mode)
         }
@@ -422,42 +429,80 @@ pub async fn check_outlook_email(pool: &Pool<Sqlite>, email_id: i64) -> Result<C
     let mut saved = 0usize;
 
     // 根据 API 模式选择收件方式
-    match api_mode {
+    let used_mode = match api_mode {
         ApiMode::Graph => {
-            // 使用 Graph API 收件
-            let records =
-                graph_api::fetch_via_graph(&access_token, &folder, 100, &proxy_config).await?;
+            // 使用 Graph API 收件，失败时回退到 IMAP
+            match graph_api::fetch_via_graph(&access_token, &folder, 100, &proxy_config).await {
+                Ok(records) => {
+                    for record in records {
+                        fetched += 1;
 
-            for record in records {
-                fetched += 1;
+                        // 构建兼容的记录用于去重检查
+                        let fetch_record = MailFetchRecord {
+                            subject: record.subject.clone(),
+                            sender: record.sender.clone(),
+                            received_time: record.received_time.clone(),
+                            content: record.content.clone(),
+                            folder: record.folder.clone(),
+                            attachments: record
+                                .attachments
+                                .iter()
+                                .map(|a| AttachmentInput {
+                                    filename: a.filename.clone(),
+                                    content_type: a.content_type.clone(),
+                                    content: a.content.clone(),
+                                })
+                                .collect(),
+                        };
 
-                // 构建兼容的记录用于去重检查
-                let fetch_record = MailFetchRecord {
-                    subject: record.subject.clone(),
-                    sender: record.sender.clone(),
-                    received_time: record.received_time.clone(),
-                    content: record.content.clone(),
-                    folder: record.folder.clone(),
-                    attachments: record
-                        .attachments
-                        .iter()
-                        .map(|a| AttachmentInput {
-                            filename: a.filename.clone(),
-                            content_type: a.content_type.clone(),
-                            content: a.content.clone(),
-                        })
-                        .collect(),
-                };
+                        if mail_record_exists(pool, email_id, &fetch_record).await? {
+                            continue;
+                        }
 
-                if mail_record_exists(pool, email_id, &fetch_record).await? {
-                    continue;
+                        let mail_id = insert_mail_record(pool, email_id, &fetch_record).await?;
+                        saved += 1;
+
+                        if !fetch_record.attachments.is_empty() {
+                            insert_attachments(pool, mail_id, &fetch_record.attachments).await?;
+                        }
+                    }
+
+                    ApiMode::Graph
                 }
+                Err(graph_err) => {
+                    // Graph API 失败，回退到 IMAP
+                    log::warn!("Graph API 失败，回退到 IMAP: {}", graph_err);
+                    let last_check_time = account.last_check_time.clone();
+                    let email_address = account.email.clone();
+                    let folder_clone = folder.clone();
+                    let access_token_clone = access_token.clone();
+                    let fetch_result = tokio::task::spawn_blocking(move || {
+                        fetch_outlook_emails(
+                            &email_address,
+                            &access_token_clone,
+                            &folder_clone,
+                            last_check_time,
+                        )
+                    })
+                    .await?;
 
-                let mail_id = insert_mail_record(pool, email_id, &fetch_record).await?;
-                saved += 1;
+                    for record in fetch_result? {
+                        fetched += 1;
+                        if mail_record_exists(pool, email_id, &record).await? {
+                            continue;
+                        }
 
-                if !fetch_record.attachments.is_empty() {
-                    insert_attachments(pool, mail_id, &fetch_record.attachments).await?;
+                        let mail_id = insert_mail_record(pool, email_id, &record).await?;
+                        saved += 1;
+
+                        if !record.attachments.is_empty() {
+                            insert_attachments(pool, mail_id, &record.attachments).await?;
+                        }
+                    }
+
+                    // 更新为 IMAP 模式
+                    update_email_api_mode(pool, email_id, ApiMode::Imap).await?;
+                    ApiMode::Imap
                 }
             }
         }
@@ -466,61 +511,165 @@ pub async fn check_outlook_email(pool: &Pool<Sqlite>, email_id: i64) -> Result<C
             let last_check_time = account.last_check_time.clone();
             let email_address = account.email.clone();
             let folder_clone = folder.clone();
+            let access_token_clone = access_token.clone();
             let fetch_result = tokio::task::spawn_blocking(move || {
                 fetch_outlook_emails(
                     &email_address,
-                    &access_token,
+                    &access_token_clone,
                     &folder_clone,
                     last_check_time,
                 )
             })
             .await?;
 
-            for record in fetch_result? {
-                fetched += 1;
-                if mail_record_exists(pool, email_id, &record).await? {
-                    continue;
+            match fetch_result {
+                Ok(records) => {
+                    for record in records {
+                        fetched += 1;
+                        if mail_record_exists(pool, email_id, &record).await? {
+                            continue;
+                        }
+
+                        let mail_id = insert_mail_record(pool, email_id, &record).await?;
+                        saved += 1;
+
+                        if !record.attachments.is_empty() {
+                            insert_attachments(pool, mail_id, &record.attachments).await?;
+                        }
+                    }
+
+                    ApiMode::Imap
                 }
+                Err(err) => {
+                    let err_msg = err.to_string();
+                    let is_auth_failed = err_msg.to_lowercase().contains("authenticate");
+                    if !is_auth_failed {
+                        return Err(err);
+                    }
 
-                let mail_id = insert_mail_record(pool, email_id, &record).await?;
-                saved += 1;
+                    // IMAP 认证失败时，回退到 Graph API 收件
+                    log::warn!("IMAP 认证失败，回退到 Graph API: {}", err_msg);
+                    let records =
+                        graph_api::fetch_via_graph(&access_token, &folder, 100, &proxy_config)
+                            .await?;
 
-                if !record.attachments.is_empty() {
-                    insert_attachments(pool, mail_id, &record.attachments).await?;
+                    for record in records {
+                        fetched += 1;
+
+                        let fetch_record = MailFetchRecord {
+                            subject: record.subject.clone(),
+                            sender: record.sender.clone(),
+                            received_time: record.received_time.clone(),
+                            content: record.content.clone(),
+                            folder: record.folder.clone(),
+                            attachments: record
+                                .attachments
+                                .iter()
+                                .map(|a| AttachmentInput {
+                                    filename: a.filename.clone(),
+                                    content_type: a.content_type.clone(),
+                                    content: a.content.clone(),
+                                })
+                                .collect(),
+                        };
+
+                        if mail_record_exists(pool, email_id, &fetch_record).await? {
+                            continue;
+                        }
+
+                        let mail_id = insert_mail_record(pool, email_id, &fetch_record).await?;
+                        saved += 1;
+
+                        if !fetch_record.attachments.is_empty() {
+                            insert_attachments(pool, mail_id, &fetch_record.attachments).await?;
+                        }
+                    }
+
+                    update_email_api_mode(pool, email_id, ApiMode::Graph).await?;
+                    ApiMode::Graph
                 }
             }
         }
         ApiMode::Auto => {
-            // 缓存命中时 Auto 模式未能自动选择，回退到 IMAP
-            log::info!("缓存命中但模式为 Auto，回退到 IMAP 模式");
-            let last_check_time = account.last_check_time.clone();
-            let email_address = account.email.clone();
-            let folder_clone = folder.clone();
-            let fetch_result = tokio::task::spawn_blocking(move || {
-                fetch_outlook_emails(
-                    &email_address,
-                    &access_token,
-                    &folder_clone,
-                    last_check_time,
-                )
-            })
-            .await?;
+            // 缓存命中时 Auto 模式，优先尝试 Graph API
+            log::info!("缓存命中但模式为 Auto，优先尝试 Graph API");
 
-            for record in fetch_result? {
-                fetched += 1;
-                if mail_record_exists(pool, email_id, &record).await? {
-                    continue;
+            match graph_api::fetch_via_graph(&access_token, &folder, 100, &proxy_config).await {
+                Ok(records) => {
+                    for record in records {
+                        fetched += 1;
+
+                        let fetch_record = MailFetchRecord {
+                            subject: record.subject.clone(),
+                            sender: record.sender.clone(),
+                            received_time: record.received_time.clone(),
+                            content: record.content.clone(),
+                            folder: record.folder.clone(),
+                            attachments: record
+                                .attachments
+                                .iter()
+                                .map(|a| AttachmentInput {
+                                    filename: a.filename.clone(),
+                                    content_type: a.content_type.clone(),
+                                    content: a.content.clone(),
+                                })
+                                .collect(),
+                        };
+
+                        if mail_record_exists(pool, email_id, &fetch_record).await? {
+                            continue;
+                        }
+
+                        let mail_id = insert_mail_record(pool, email_id, &fetch_record).await?;
+                        saved += 1;
+
+                        if !fetch_record.attachments.is_empty() {
+                            insert_attachments(pool, mail_id, &fetch_record.attachments).await?;
+                        }
+                    }
+
+                    // Graph API 成功，更新模式
+                    update_email_api_mode(pool, email_id, ApiMode::Graph).await?;
+                    ApiMode::Graph
                 }
+                Err(graph_err) => {
+                    // Graph API 失败，回退到 IMAP
+                    log::warn!("Graph API 失败，回退到 IMAP: {}", graph_err);
+                    let last_check_time = account.last_check_time.clone();
+                    let email_address = account.email.clone();
+                    let folder_clone = folder.clone();
+                    let access_token_clone = access_token.clone();
+                    let fetch_result = tokio::task::spawn_blocking(move || {
+                        fetch_outlook_emails(
+                            &email_address,
+                            &access_token_clone,
+                            &folder_clone,
+                            last_check_time,
+                        )
+                    })
+                    .await?;
 
-                let mail_id = insert_mail_record(pool, email_id, &record).await?;
-                saved += 1;
+                    for record in fetch_result? {
+                        fetched += 1;
+                        if mail_record_exists(pool, email_id, &record).await? {
+                            continue;
+                        }
 
-                if !record.attachments.is_empty() {
-                    insert_attachments(pool, mail_id, &record.attachments).await?;
+                        let mail_id = insert_mail_record(pool, email_id, &record).await?;
+                        saved += 1;
+
+                        if !record.attachments.is_empty() {
+                            insert_attachments(pool, mail_id, &record.attachments).await?;
+                        }
+                    }
+
+                    // IMAP 成功，更新模式
+                    update_email_api_mode(pool, email_id, ApiMode::Imap).await?;
+                    ApiMode::Imap
                 }
             }
         }
-    }
+    };
 
     update_last_check_time(pool, email_id).await?;
 
@@ -531,7 +680,7 @@ pub async fn check_outlook_email(pool: &Pool<Sqlite>, email_id: i64) -> Result<C
         saved,
         message: format!(
             "成功获取 {fetched} 封邮件，新增 {saved} 封 (模式: {:?})",
-            api_mode
+            used_mode
         ),
     })
 }
@@ -540,13 +689,14 @@ pub async fn check_outlook_email(pool: &Pool<Sqlite>, email_id: i64) -> Result<C
 pub async fn batch_check_outlook_emails(
     pool: &Pool<Sqlite>,
     email_ids: Vec<i64>,
+    folder: &str,
 ) -> Result<BatchCheckResult> {
     let mut results = Vec::new();
     let mut success_count = 0usize;
     let mut failed_count = 0usize;
 
     for email_id in email_ids {
-        match check_outlook_email(pool, email_id).await {
+        match check_outlook_email(pool, email_id, folder).await {
             Ok(result) => {
                 success_count += 1;
                 results.push(result);
@@ -624,9 +774,7 @@ async fn refresh_outlook_access_token_with_proxy(
         });
     }
 
-    let error = response
-        .error
-        .unwrap_or_else(|| "未知错误".to_string());
+    let error = response.error.unwrap_or_else(|| "未知错误".to_string());
     let description = response
         .error_description
         .unwrap_or_else(|| "未知错误描述".to_string());
@@ -643,14 +791,31 @@ async fn update_email_token(pool: &Pool<Sqlite>, email_id: i64, access_token: &s
     Ok(())
 }
 
-/// 更新邮箱最后检查时间
-async fn update_last_check_time(pool: &Pool<Sqlite>, email_id: i64) -> Result<()> {
-    let now = Utc::now().to_rfc3339();
-    sqlx::query("UPDATE emails SET last_check_time = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
-        .bind(now)
+/// 更新邮箱使用的 API 模式
+async fn update_email_api_mode(pool: &Pool<Sqlite>, email_id: i64, mode: ApiMode) -> Result<()> {
+    let mode_value = match mode {
+        ApiMode::Graph => "graph",
+        ApiMode::Imap => "imap",
+        ApiMode::Auto => "auto",
+    };
+    sqlx::query("UPDATE emails SET api_mode = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+        .bind(mode_value)
         .bind(email_id)
         .execute(pool)
         .await?;
+    Ok(())
+}
+
+/// 更新邮箱最后检查时间
+async fn update_last_check_time(pool: &Pool<Sqlite>, email_id: i64) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        "UPDATE emails SET last_check_time = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+    )
+    .bind(now)
+    .bind(email_id)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -663,10 +828,11 @@ fn fetch_outlook_emails(
 ) -> Result<Vec<MailFetchRecord>> {
     // 使用更稳定的企业级 IMAP 服务器
     let tls = TlsConnector::builder().build()?;
-    let tcp = TcpStream::connect_timeout(
-        &"outlook.office365.com:993".parse().unwrap(),
-        Duration::from_secs(30),
-    )?;
+    let addr = "outlook.office365.com:993"
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| anyhow!("无法解析 IMAP 服务器地址"))?;
+    let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(30))?;
     let stream = tls.connect("outlook.office365.com", tcp)?;
     let client = imap::Client::new(stream);
 
@@ -700,13 +866,12 @@ fn fetch_outlook_emails(
                 Some(body) => body,
                 None => continue,
             };
-
             let parsed = match mailparse::parse_mail(raw) {
                 Ok(mail) => mail,
                 Err(_) => continue,
             };
 
-            match build_mail_record(parsed, "INBOX") {
+            match build_mail_record(parsed, folder) {
                 Ok(record) => records.push(record),
                 Err(_) => continue,
             }
@@ -781,7 +946,8 @@ fn walk_parts(
         let content_type = part.ctype.mimetype.to_lowercase();
         let filename = extract_filename(part);
         let disposition = part.get_content_disposition();
-        let is_attachment = disposition.disposition == DispositionType::Attachment || filename.is_some();
+        let is_attachment =
+            disposition.disposition == DispositionType::Attachment || filename.is_some();
 
         if is_attachment {
             let content = part.get_body_raw().unwrap_or_default();
@@ -829,7 +995,11 @@ fn extract_filename(part: &ParsedMail) -> Option<String> {
 }
 
 /// 检查邮件记录是否已存在
-async fn mail_record_exists(pool: &Pool<Sqlite>, email_id: i64, record: &MailFetchRecord) -> Result<bool> {
+async fn mail_record_exists(
+    pool: &Pool<Sqlite>,
+    email_id: i64,
+    record: &MailFetchRecord,
+) -> Result<bool> {
     if let Some(received_time) = &record.received_time {
         let exists = sqlx::query_scalar::<_, i64>(
             "SELECT id FROM mail_records WHERE email_id = ? AND subject IS ? AND sender IS ? AND received_time = ? LIMIT 1",
@@ -858,7 +1028,11 @@ async fn mail_record_exists(pool: &Pool<Sqlite>, email_id: i64, record: &MailFet
 }
 
 /// 新增邮件记录
-async fn insert_mail_record(pool: &Pool<Sqlite>, email_id: i64, record: &MailFetchRecord) -> Result<i64> {
+async fn insert_mail_record(
+    pool: &Pool<Sqlite>,
+    email_id: i64,
+    record: &MailFetchRecord,
+) -> Result<i64> {
     let has_attachments = if record.attachments.is_empty() { 0 } else { 1 };
     let mail_id: i64 = sqlx::query_scalar(
         "INSERT INTO mail_records (email_id, subject, sender, received_time, content, folder, has_attachments) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id",

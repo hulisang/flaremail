@@ -13,7 +13,6 @@ dist-ssr
 *.local
 
 # Editor directories and files
-.vscode/*
 !.vscode/extensions.json
 .idea
 .DS_Store
@@ -23,8 +22,8 @@ dist-ssr
 *.sln
 *.sw?
 .cunzhi-memory/
-.serena/*
-.vscode/*
-.zencoder/*
-.zenflow/*
-.MS_OAuth2API_Next/*
+.serena/
+.vscode/
+.zencoder/
+.zenflow/
+MS_OAuth2API_Next/

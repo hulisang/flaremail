@@ -1,14 +1,68 @@
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
+import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
+import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { open } from '@tauri-apps/plugin-dialog';
 import { readTextFile } from '@tauri-apps/plugin-fs';
 import {
-    Upload, FileText, Trash2,
-    Download, Clipboard, RefreshCw, X
+    Upload, FileText, Trash2, Inbox, Trash,
+    Download, Clipboard, RefreshCw, X,
+    Eye, EyeOff, Paperclip
 } from 'lucide-react';
 import { useAppStore } from '../store/app';
-import type { EmailAccount } from '../types';
+import MailDetailModal from './MailDetailModal';
+import type { EmailAccount, MailRecord } from '../types';
+
+type MailFolder = 'INBOX' | 'JUNK';
+
+// 清理 HTML 标签，提取纯文本
+const stripHtml = (html: string | null | undefined): string => {
+    if (!html) return '';
+    // 移除 HTML 标签
+    let text = html.replace(/<[^>]*>/g, ' ');
+    // 解码 HTML 实体
+    text = text.replace(/&nbsp;/g, ' ')
+        .replace(/&amp;/g, '&')
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '"');
+    // 压缩多余空白
+    text = text.replace(/\s+/g, ' ').trim();
+    return text;
+};
+
+// 获取发件人名称首字母
+const getInitials = (sender: string | null | undefined): string => {
+    if (!sender) return '?';
+    // 尝试提取 <email> 之前的名称部分
+    const nameMatch = sender.match(/^([^<]+)/);
+    const name = nameMatch ? nameMatch[1].trim() : sender;
+    // 获取首字母
+    const words = name.split(/\s+/).filter(w => w.length > 0);
+    if (words.length >= 2) {
+        return (words[0][0] + words[1][0]).toUpperCase();
+    }
+    return name.substring(0, 2).toUpperCase();
+};
+
+// 格式化日期为友好格式
+const formatDate = (dateStr: string | null | undefined): string => {
+    if (!dateStr) return '-';
+    const date = new Date(dateStr);
+    const now = new Date();
+    const diffDays = Math.floor((now.getTime() - date.getTime()) / (1000 * 60 * 60 * 24));
+
+    if (diffDays === 0) {
+        return date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+    } else if (diffDays === 1) {
+        return '昨天';
+    } else if (diffDays < 7) {
+        return date.toLocaleDateString('zh-CN', { weekday: 'short' });
+    } else {
+        return date.toLocaleDateString('zh-CN', { month: 'short', day: 'numeric' });
+    }
+};
 
 export default function EmailManagement() {
     const { t } = useAppStore();
@@ -20,6 +74,12 @@ export default function EmailManagement() {
     const [isDragging, setIsDragging] = useState(false);
     const [currentPage, setCurrentPage] = useState(1);
     const [pageSize, setPageSize] = useState(10);
+    // 密码显示状态（默认隐藏）
+    const [showPasswords, setShowPasswords] = useState(false);
+    const [toastMessage, setToastMessage] = useState<string | null>(null);
+    // 通过更新 key 重新触发 toast 动画，避免同文案时不显示
+    const [toastId, setToastId] = useState(0);
+    const toastTimerRef = useRef<number | null>(null);
 
     // 导入/导出状态
     const [separator, setSeparator] = useState('----');
@@ -29,9 +89,58 @@ export default function EmailManagement() {
     // 粘贴导入模态框状态
     const [showPasteModal, setShowPasteModal] = useState(false);
     const [pasteContent, setPasteContent] = useState('');
+    const [mailViewerOpen, setMailViewerOpen] = useState(false);
+    const [mailViewerEmail, setMailViewerEmail] = useState<EmailAccount | null>(null);
+    const [mailViewerFolder, setMailViewerFolder] = useState<MailFolder>('INBOX');
+    const [mailViewerRecords, setMailViewerRecords] = useState<MailRecord[]>([]);
+    const [mailViewerLoading, setMailViewerLoading] = useState(false);
+    const [selectedMail, setSelectedMail] = useState<MailRecord | null>(null);
+    const [isDetailOpen, setIsDetailOpen] = useState(false);
+
+    // 处理拖拽导入的回调（需要 useCallback 保持引用稳定）
+    const handleDropImport = useCallback(async (paths: string[]) => {
+        if (!paths || paths.length === 0) return;
+
+        const txtPath = paths.find(p => p.toLowerCase().endsWith('.txt'));
+        if (!txtPath) {
+            alert('请拖拽 .txt 文件');
+            return;
+        }
+
+        try {
+            const content = await readTextFile(txtPath);
+            handleBatchImport(content);
+        } catch (error) {
+            console.error('读取拖拽文件失败:', error);
+            alert('读取文件失败');
+        }
+    }, []);
 
     useEffect(() => {
         loadEmails();
+    }, []);
+
+    // 监听 Tauri drag-drop 事件获取文件路径
+    useEffect(() => {
+        let unlisten: UnlistenFn | null = null;
+
+        const setup = async () => {
+            unlisten = await listen<{ paths: string[] }>('tauri://drag-drop', (event) => {
+                handleDropImport(event.payload.paths);
+            });
+        };
+
+        setup();
+        return () => { unlisten?.(); };
+    }, [handleDropImport]);
+
+    useEffect(() => {
+        return () => {
+            if (toastTimerRef.current) {
+                window.clearTimeout(toastTimerRef.current);
+                toastTimerRef.current = null;
+            }
+        };
     }, []);
 
     const loadEmails = async () => {
@@ -134,6 +243,68 @@ export default function EmailManagement() {
         setPasteContent('');
     };
 
+    const normalizeFolder = (folder?: string): MailFolder => {
+        if (!folder) {
+            return 'INBOX';
+        }
+
+        const normalized = folder.trim().toLowerCase();
+        // 匹配垃圾邮件文件夹（Junk/Spam）
+        if (normalized.includes('junk') || normalized.includes('spam') || normalized.includes('垃圾')) {
+            return 'JUNK';
+        }
+
+        return 'INBOX';
+    };
+
+    const filterMailRecordsByFolder = (records: MailRecord[], folder: MailFolder) =>
+        records.filter((record) => normalizeFolder(record.folder) === folder);
+
+    const loadMailViewerRecords = async (emailId: number, folder: MailFolder) => {
+        setMailViewerLoading(true);
+        try {
+            const records = await invoke<MailRecord[]>('get_mail_records', { emailId });
+            setMailViewerRecords(filterMailRecordsByFolder(records, folder));
+        } catch (error) {
+            console.error(error);
+            setMailViewerRecords([]);
+        } finally {
+            setMailViewerLoading(false);
+        }
+    };
+
+    const handleOpenMailbox = async (account: EmailAccount, folder: MailFolder) => {
+        setMailViewerEmail(account);
+        setMailViewerFolder(folder);
+        setMailViewerRecords([]);
+        setMailViewerOpen(true);
+        setMailViewerLoading(true);
+
+        try {
+            // 先触发收件操作，传递文件夹参数
+            await invoke('check_outlook_email', { emailId: account.id, folder });
+        } catch (error) {
+            console.error('收件失败:', error);
+            // 收件失败不阻止查看已有邮件
+        }
+
+        // 加载邮件记录
+        loadMailViewerRecords(account.id, folder);
+    };
+
+    const handleCloseMailbox = () => {
+        setMailViewerOpen(false);
+        setMailViewerEmail(null);
+        setMailViewerRecords([]);
+        setSelectedMail(null);
+        setIsDetailOpen(false);
+    };
+
+    const handleViewMailDetail = (mail: MailRecord) => {
+        setSelectedMail(mail);
+        setIsDetailOpen(true);
+    };
+
     const handleDelete = async (id: number) => {
         if (!confirm('确定删除此邮箱吗？')) return;
         try {
@@ -177,6 +348,34 @@ export default function EmailManagement() {
         }
     };
 
+    const showToast = (message: string) => {
+        setToastMessage(message);
+        setToastId((prev) => prev + 1);
+        if (toastTimerRef.current) {
+            window.clearTimeout(toastTimerRef.current);
+        }
+        toastTimerRef.current = window.setTimeout(() => {
+            setToastMessage(null);
+            toastTimerRef.current = null;
+        }, 2000);
+    };
+
+    // 复制字段值到剪贴板（成功 toast，失败 alert）
+    const handleCopyValue = async (value: string, displayValue: string = value) => {
+        if (!navigator?.clipboard) {
+            alert('当前环境不支持剪贴板复制');
+            return;
+        }
+
+        try {
+            await navigator.clipboard.writeText(value);
+            showToast(`${displayValue}已复制`);
+        } catch (error) {
+            console.error(error);
+            alert('复制失败');
+        }
+    };
+
     const filteredEmails = emails.filter(e => e.email.toLowerCase().includes(searchQuery.toLowerCase()));
     const totalPages = Math.max(1, Math.ceil(filteredEmails.length / pageSize));
     const pageStart = (currentPage - 1) * pageSize;
@@ -216,10 +415,18 @@ export default function EmailManagement() {
     return (
         <div className="management-content animate-in">
             {/* 顶部标题 */}
-            <div className="page-header">
+            <div className="page-header-inline">
                 <h1 className="page-title">邮箱管理</h1>
-                <p className="page-subtitle">导入、管理和查看您的邮箱账号</p>
+                <span className="page-separator">—</span>
+                <span className="page-subtitle-inline">导入、管理和查看您的邮箱账号</span>
             </div>
+
+            {toastMessage && createPortal(
+                <div className="toast-container" role="status" aria-live="polite">
+                    <div key={toastId} className="toast">{toastMessage}</div>
+                </div>,
+                document.body
+            )}
 
             {/* 导入/导出管理卡片 */}
             <section className="management-section">
@@ -286,7 +493,7 @@ export default function EmailManagement() {
                     </div>
 
                     <div
-                        className={`upload-area transition-all duration-200 border-2 border-dashed rounded-lg p-8 flex flex-col items-center justify-center cursor-pointer gap-2 ${isDragging ? 'border-primary bg-primary/10 scale-[1.02]' : 'border-border hover:border-primary/50 hover:bg-accent/50'}`}
+                        className={`upload-area transition-all duration-200 ${isDragging ? 'border-primary bg-primary/10 scale-[1.02]' : ''}`}
                         onClick={handleSelectFile}
                         onDragOver={(e) => {
                             e.preventDefault();
@@ -296,43 +503,15 @@ export default function EmailManagement() {
                             e.preventDefault();
                             setIsDragging(false);
                         }}
-                        onDrop={async (e) => {
+                        onDrop={(e) => {
                             e.preventDefault();
                             setIsDragging(false);
-                            const files = e.dataTransfer.files;
-                            if (files.length === 0) {
-                                return;
-                            }
-
-                            const file = files[0];
-                            if (!file.name.toLowerCase().endsWith('.txt')) {
-                                alert('请上传 .txt 文件');
-                                return;
-                            }
-
-                            try {
-                                const filePath = (file as { path?: string }).path;
-                                if (filePath) {
-                                    try {
-                                        const text = await readTextFile(filePath);
-                                        handleBatchImport(text);
-                                        return;
-                                    } catch (error) {
-                                        console.error(error);
-                                    }
-                                }
-
-                                const text = await file.text();
-                                handleBatchImport(text);
-                            } catch (error) {
-                                console.error(error);
-                                alert('读取拖拽文件失败');
-                            }
+                            // 实际文件处理由 tauri://drag-drop 事件监听器完成
                         }}
                     >
-                        <Upload size={32} className={`transition-colors ${isDragging ? 'text-primary' : 'text-muted-foreground'}`} />
-                        <div className="text-sm font-medium">点击选择文件 或 将TXT文件拖拽至此</div>
-                        <div className="text-xs text-muted-foreground">格式: 邮箱----密码----client_id----refresh_token</div>
+                        <Upload size={16} className={`transition-colors ${isDragging ? 'text-primary' : 'text-muted-foreground'}`} />
+                        <span>点击选择文件 或 将TXT文件拖拽至此</span>
+                        <span className="text-muted-foreground">| 格式: 邮箱----密码----client_id----refresh_token</span>
                     </div>
 
                     {importResult && (
@@ -364,10 +543,23 @@ export default function EmailManagement() {
                                 </th>
                                 <th style={{ width: '60px' }}>#</th>
                                 <th>邮箱地址</th>
-                                <th>密码</th>
+                                <th>
+                                    <div className="flex items-center gap-2">
+                                        <span>密码</span>
+                                        <button
+                                            className="btn-icon-action password-toggle"
+                                            onClick={() => setShowPasswords((prev) => !prev)}
+                                            title={showPasswords ? '隐藏密码' : '显示密码'}
+                                            aria-label={showPasswords ? '隐藏密码' : '显示密码'}
+                                            type="button"
+                                        >
+                                            {showPasswords ? <EyeOff size={16} /> : <Eye size={16} />}
+                                        </button>
+                                    </div>
+                                </th>
                                 <th>客户端ID</th>
                                 <th>刷新令牌</th>
-                                <th style={{ width: '100px' }}>操作</th>
+                                <th style={{ width: '160px' }}>操作</th>
                             </tr>
                         </thead>
                         <tbody>
@@ -398,23 +590,61 @@ export default function EmailManagement() {
                                             />
                                         </td>
                                         <td>{pageStart + index + 1}</td>
-                                        <td>{email.email}</td>
-                                        <td className="mono">********</td>
-                                        <td className="mono text-muted truncate" title={email.client_id}>
+                                        <td
+                                            className="copyable-cell"
+                                            title="点击复制"
+                                            onClick={() => handleCopyValue(email.email)}
+                                        >
+                                            {email.email}
+                                        </td>
+                                        <td
+                                            className={`mono copyable-cell ${showPasswords ? '' : 'disabled'}`}
+                                            title={showPasswords ? '点击复制' : '显示后可复制'}
+                                            onClick={showPasswords ? () => handleCopyValue(email.password) : undefined}
+                                        >
+                                            {showPasswords ? email.password : '******'}
+                                        </td>
+                                        <td
+                                            className="mono text-muted truncate copyable-cell"
+                                            title={`${email.client_id}（点击复制）`}
+                                            onClick={() => handleCopyValue(email.client_id)}
+                                        >
                                             {email.client_id}
                                         </td>
-                                        <td className="mono text-muted truncate" title={email.refresh_token}>
+                                        <td
+                                            className="mono text-muted truncate copyable-cell"
+                                            title={`${email.refresh_token}（点击复制）`}
+                                            onClick={() => handleCopyValue(email.refresh_token, `${email.refresh_token.substring(0, 20)}...`)}
+                                        >
                                             {email.refresh_token.substring(0, 20)}...
                                         </td>
                                         <td>
-                                            <button
-                                                className="btn-icon-action delete"
-                                                onClick={() => handleDelete(email.id)}
-                                                title="删除"
-                                                type="button"
-                                            >
-                                                <Trash2 size={16} />
-                                            </button>
+                                            <div className="flex items-center gap-2">
+                                                <button
+                                                    className="btn-icon-action"
+                                                    onClick={() => handleOpenMailbox(email, 'INBOX')}
+                                                    title={t.menu.inbox}
+                                                    type="button"
+                                                >
+                                                    <Inbox size={16} />
+                                                </button>
+                                                <button
+                                                    className="btn-icon-action"
+                                                    onClick={() => handleOpenMailbox(email, 'JUNK')}
+                                                    title={t.menu.trash}
+                                                    type="button"
+                                                >
+                                                    <Trash size={16} />
+                                                </button>
+                                                <button
+                                                    className="btn-icon-action delete"
+                                                    onClick={() => handleDelete(email.id)}
+                                                    title="删除"
+                                                    type="button"
+                                                >
+                                                    <Trash2 size={16} />
+                                                </button>
+                                            </div>
                                         </td>
                                     </tr>
                                 ))
@@ -478,6 +708,92 @@ export default function EmailManagement() {
                     </div>
                 )}
             </section>
+
+            {mailViewerOpen && mailViewerEmail && (
+                <div className="modal-overlay-content-area" onClick={handleCloseMailbox}>
+                    <div
+                        className="modal-content"
+                        onClick={(e) => e.stopPropagation()}
+                        style={{ minWidth: '760px', maxWidth: '980px' }}
+                    >
+                        <div className="modal-header">
+                            <div>
+                                <h3>{mailViewerEmail.email}</h3>
+                                <p className="text-xs text-muted-foreground">
+                                    {mailViewerFolder === 'INBOX' ? t.menu.inbox : t.menu.trash}
+                                </p>
+                            </div>
+                            <button
+                                className="modal-close-btn"
+                                onClick={handleCloseMailbox}
+                                type="button"
+                            >
+                                <X size={20} />
+                            </button>
+                        </div>
+                        <div className="modal-body">
+                            {mailViewerLoading ? (
+                                <div className="loading-state">
+                                    <RefreshCw size={32} className="spinning text-muted-foreground" />
+                                    <p className="text-muted">加载中...</p>
+                                </div>
+                            ) : mailViewerRecords.length === 0 ? (
+                                <div className="empty-state">
+                                    <div className="empty-icon-box">
+                                        <FileText size={32} />
+                                    </div>
+                                    <span>{t.empty.title}</span>
+                                </div>
+                            ) : (
+                                <div className="mail-records-list">
+                                    {mailViewerRecords.map((mail) => (
+                                        <div
+                                            key={mail.id}
+                                            className="mail-record-item"
+                                            onClick={() => handleViewMailDetail(mail)}
+                                        >
+                                            <div className="mail-avatar">
+                                                {getInitials(mail.sender)}
+                                            </div>
+                                            <div className="mail-content-wrap">
+                                                <div className="mail-record-header">
+                                                    <span className="mail-sender">{mail.sender?.split('<')[0]?.trim() || 'Unknown'}</span>
+                                                    <span className="mail-date">
+                                                        {formatDate(mail.received_time)}
+                                                    </span>
+                                                </div>
+                                                <div className="mail-subject">
+                                                    {mail.has_attachments === 1 && <Paperclip size={14} className="mail-attachment-icon" />}
+                                                    {mail.subject || '(无主题)'}
+                                                </div>
+                                                <div className="mail-preview">
+                                                    {stripHtml(mail.content)?.substring(0, 120) || '-'}
+                                                </div>
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
+                        </div>
+                        <div className="modal-footer">
+                            <button className="btn btn-secondary" onClick={handleCloseMailbox} type="button">
+                                关闭
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {selectedMail && (
+                <MailDetailModal
+                    isOpen={isDetailOpen}
+                    onClose={() => {
+                        setIsDetailOpen(false);
+                        setSelectedMail(null);
+                    }}
+                    mail={selectedMail}
+                />
+            )}
 
             {/* 粘贴导入模态框 */}
             {showPasteModal && (
