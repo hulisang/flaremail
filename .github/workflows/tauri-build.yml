@@ -56,7 +56,11 @@ jobs:
         with:
           tagName: v__VERSION__
           releaseName: 'FlareMail v__VERSION__'
-          releaseBody: '请下载对应平台的安装包：\n- Windows: .msi 或 .exe\n- macOS: .dmg\n- Linux: .deb 或 .AppImage'
+          releaseBody: |
+            请下载对应平台的安装包：
+            - Windows: .msi 或 .exe
+            - macOS: .dmg
+            - Linux: .deb 或 .AppImage
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
