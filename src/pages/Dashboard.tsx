@@ -1,14 +1,40 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
-import { Users } from 'lucide-react';
+import { openUrl } from '@tauri-apps/plugin-opener';
+import { Users, Download, X } from 'lucide-react';
 import EmailManagement from '../components/EmailManagement';
 import About from '../components/About';
 import { ModeToggle } from '../components/mode-toggle';
+import { checkForUpdate, type UpdateInfo } from '../utils/updateChecker';
 import type { EmailAccount } from '../types';
 
 export default function Dashboard() {
     const [view, setView] = useState<'dashboard' | 'management' | 'about'>('dashboard');
     const [accounts, setAccounts] = useState<EmailAccount[]>([]);
+
+    // 更新提示 toast 状态
+    const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
+    const [showUpdateToast, setShowUpdateToast] = useState(false);
+    const hasCheckedUpdate = useRef(false);
+
+    // 首次加载时自动检查更新
+    useEffect(() => {
+        if (hasCheckedUpdate.current) return;
+        hasCheckedUpdate.current = true;
+
+        checkForUpdate().then(info => {
+            if (info) {
+                setUpdateInfo(info);
+                setShowUpdateToast(true);
+            }
+        });
+    }, []);
+
+    // 关闭更新提示
+    const dismissUpdateToast = () => {
+        setShowUpdateToast(false);
+    };
 
     useEffect(() => {
         // 切换到仪表盘视图时加载邮箱列表
@@ -92,6 +118,32 @@ export default function Dashboard() {
                     </div>
                 )}
             </main>
+
+            {/* 自动更新检查 Toast */}
+            {showUpdateToast && updateInfo && createPortal(
+                <div className="toast-container" role="status" aria-live="polite">
+                    <div className="toast update-toast">
+                        <div className="flex items-center gap-3">
+                            <span>发现新版本 {updateInfo.version}</span>
+                            <button
+                                onClick={() => openUrl(updateInfo.downloadUrl)}
+                                className="flex items-center gap-1 px-3 py-1 bg-primary text-primary-foreground rounded-lg text-sm font-semibold hover:opacity-90 transition-opacity"
+                            >
+                                <Download size={14} />
+                                <span>前往下载</span>
+                            </button>
+                            <button
+                                onClick={dismissUpdateToast}
+                                className="ml-2 p-1 hover:bg-secondary/50 rounded transition-colors"
+                                aria-label="关闭"
+                            >
+                                <X size={16} />
+                            </button>
+                        </div>
+                    </div>
+                </div>,
+                document.body
+            )}
         </div>
     );
 }
