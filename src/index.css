@@ -1860,6 +1860,27 @@ button {
   }
 }
 
+/* 更新提示 toast（不自动消失，可交互） */
+.toast.update-toast {
+  animation: toast-in 0.3s ease forwards;
+  pointer-events: auto;
+  white-space: normal;
+  max-width: min(90vw, 520px);
+  padding: 0.75rem 1rem;
+}
+
+@keyframes toast-in {
+  0% {
+    opacity: 0;
+    transform: translateY(8px) scale(0.98);
+  }
+
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
 .password-toggle {
   padding: 0.2rem;
 }

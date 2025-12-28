@@ -1,35 +1,124 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import { getVersion } from '@tauri-apps/api/app';
-import { check } from '@tauri-apps/plugin-updater';
 import { openUrl } from '@tauri-apps/plugin-opener';
-import { Github, Info, RefreshCw, Heart } from 'lucide-react';
+import { Github, Info, RefreshCw, Heart, Download, X } from 'lucide-react';
+import logoImage from '../assets/logo.png';
+
+// GitHub API 响应类型
+interface GitHubRelease {
+    tag_name: string;
+    html_url: string;
+}
+
+// 新版本信息接口
+interface UpdateInfo {
+    version: string;
+    downloadUrl: string;
+}
+
+// 比较版本号（v1.2.3 格式）
+function compareVersions(current: string, latest: string): number {
+    const normalize = (v: string) => v.replace(/^v/, '').split('.').map(n => parseInt(n, 10) || 0);
+    const curr = normalize(current);
+    const lat = normalize(latest);
+    for (let i = 0; i < Math.max(curr.length, lat.length); i++) {
+        const c = curr[i] || 0;
+        const l = lat[i] || 0;
+        if (l > c) return 1;   // latest 更新
+        if (l < c) return -1;  // current 更新
+    }
+    return 0; // 相同版本
+}
 
 export default function About() {
     const [version, setVersion] = useState<string>('加载中...');
     const [checking, setChecking] = useState(false);
+    // Toast 状态
+    const [toastMessage, setToastMessage] = useState<string | null>(null);
+    const [toastId, setToastId] = useState(0);
+    const toastTimerRef = useRef<number | null>(null);
+    // 新版本信息（用于显示下载按钮）
+    const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
 
     useEffect(() => {
         getVersion().then(setVersion).catch(console.error);
     }, []);
 
+    // 清理 toast 定时器
+    useEffect(() => {
+        return () => {
+            if (toastTimerRef.current) {
+                window.clearTimeout(toastTimerRef.current);
+            }
+        };
+    }, []);
+
+    // 显示 toast（duration 为 0 表示不自动消失）
+    const showToast = (message: string, duration: number = 3000) => {
+        setToastMessage(message);
+        setToastId((prev) => prev + 1);
+        if (toastTimerRef.current) {
+            window.clearTimeout(toastTimerRef.current);
+            toastTimerRef.current = null;
+        }
+        if (duration > 0) {
+            toastTimerRef.current = window.setTimeout(() => {
+                setToastMessage(null);
+                setUpdateInfo(null);
+                toastTimerRef.current = null;
+            }, duration);
+        }
+    };
+
+    // 关闭 toast
+    const dismissToast = () => {
+        if (toastTimerRef.current) {
+            window.clearTimeout(toastTimerRef.current);
+            toastTimerRef.current = null;
+        }
+        setToastMessage(null);
+        setUpdateInfo(null);
+    };
+
+    // 使用 GitHub API 检查更新
     const handleCheckUpdate = async () => {
         setChecking(true);
         try {
-            const update = await check();
-            if (update) {
-                console.log(`发现新版本: ${update.version}`);
-                // 执行下载和安装
-                // 注意：在打包版本中，这将触发正式的下载流程
-                await update.downloadAndInstall();
-                // 下载安装完毕后提示用户手动重启
-                alert('更新已安装，请重启应用以应用新版本。');
+            // 获取当前版本（确保已加载）
+            const currentVersion = version === '加载中...' ? await getVersion() : version;
+
+            // 调用 GitHub API 获取最新 release
+            const response = await fetch('https://api.github.com/repos/hulisang/flaremail/releases/latest');
+
+            if (!response.ok) {
+                if (response.status === 404) {
+                    showToast('暂无发布版本');
+                } else {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+                return;
+            }
+
+            const release: GitHubRelease = await response.json();
+            const latestVersion = release.tag_name;
+
+            // 比较版本
+            const cmp = compareVersions(currentVersion, latestVersion);
+
+            if (cmp > 0) {
+                // 有新版本
+                setUpdateInfo({
+                    version: latestVersion,
+                    downloadUrl: release.html_url
+                });
+                showToast(`发现新版本 ${latestVersion}`, 0);
             } else {
-                alert('当前已是最新版本');
+                showToast('当前已是最新版本 ✓');
             }
         } catch (error) {
             console.error('检查更新失败', error);
-            // 开发环境下如果没有配置正确的 endpoints 或没有发布 release，通常会走到这里
-            alert('检查更新失败：未发现可用的更新服务器或网络连接异常');
+            showToast('检查更新失败，请检查网络连接');
         } finally {
             setChecking(false);
         }
@@ -40,7 +129,7 @@ export default function About() {
             <div className="flex flex-col items-center text-center space-y-6">
                 {/* Logo 显示 */}
                 <div className="w-24 h-24 flex items-center justify-center mb-4">
-                    <img src="/src/assets/logo.png" alt="FlareMail Logo" className="w-full h-full object-contain" />
+                    <img src={logoImage} alt="FlareMail Logo" className="w-full h-full object-contain" />
                 </div>
 
                 <div className="space-y-2">
@@ -93,6 +182,34 @@ export default function About() {
                     </p>
                 </div>
             </div>
+
+            {/* Toast 提示 */}
+            {toastMessage && createPortal(
+                <div className="toast-container" role="status" aria-live="polite">
+                    <div key={toastId} className="toast update-toast">
+                        <div className="flex items-center gap-3">
+                            <span>{toastMessage}</span>
+                            {updateInfo && (
+                                <button
+                                    onClick={() => openUrl(updateInfo.downloadUrl)}
+                                    className="flex items-center gap-1 px-3 py-1 bg-primary text-primary-foreground rounded-lg text-sm font-semibold hover:opacity-90 transition-opacity"
+                                >
+                                    <Download size={14} />
+                                    <span>前往下载</span>
+                                </button>
+                            )}
+                            <button
+                                onClick={dismissToast}
+                                className="ml-2 p-1 hover:bg-secondary/50 rounded transition-colors"
+                                aria-label="关闭"
+                            >
+                                <X size={16} />
+                            </button>
+                        </div>
+                    </div>
+                </div>,
+                document.body
+            )}
         </div>
     );
 }
