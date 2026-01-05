@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Version-0.3.3-black?style=flat-square" alt="Version" />
+  <img src="https://img.shields.io/badge/Version-0.3.4-black?style=flat-square" alt="Version" />
   <img src="https://img.shields.io/badge/Tauri-v2-24c8db?style=flat-square&logo=tauri" alt="Tauri" />
   <img src="https://img.shields.io/badge/React-19-61dafb?style=flat-square&logo=react" alt="React" />
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License" />
