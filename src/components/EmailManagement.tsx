@@ -3,8 +3,8 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import { open } from '@tauri-apps/plugin-dialog';
-import { readTextFile } from '@tauri-apps/plugin-fs';
+import { open, save } from '@tauri-apps/plugin-dialog';
+import { readTextFile, writeTextFile } from '@tauri-apps/plugin-fs';
 import {
     Upload, FileText, Trash2, Inbox, Trash,
     Download, Clipboard, RefreshCw, X,
@@ -256,6 +256,41 @@ export default function EmailManagement() {
     const handleClosePasteModal = () => {
         setShowPasteModal(false);
         setPasteContent('');
+    };
+
+    // 导出邮箱到文件
+    const handleExportEmails = async () => {
+        if (emails.length === 0) {
+            showToast('没有可导出的邮箱数据');
+            return;
+        }
+
+        try {
+            // 打开保存对话框
+            const filePath = await save({
+                defaultPath: 'emails_export.txt',
+                filters: [{
+                    name: 'Text',
+                    extensions: ['txt']
+                }]
+            });
+
+            if (!filePath) {
+                return; // 用户取消
+            }
+
+            // 根据当前分隔符格式化导出内容
+            const exportContent = emails.map(email =>
+                `${email.email}${separator}${email.password}${separator}${email.client_id}${separator}${email.refresh_token}`
+            ).join('\n');
+
+            // 写入文件
+            await writeTextFile(filePath, exportContent);
+            showToast(`成功导出 ${emails.length} 个邮箱`);
+        } catch (error) {
+            console.error('导出失败:', error);
+            alert(`导出失败: ${error}`);
+        }
     };
 
     const normalizeFolder = (folder?: string): MailFolder => {
@@ -537,11 +572,11 @@ export default function EmailManagement() {
                                 <Upload size={16} className="btn-icon-space" />
                                 选择文件
                             </button>
-                            <button className="btn btn-purple" type="button">
+                            <button className="btn btn-purple" onClick={handlePasteImport} type="button">
                                 <Upload size={16} className="btn-icon-space" />
                                 导入邮箱
                             </button>
-                            <button className="btn btn-green" type="button">
+                            <button className="btn btn-green" onClick={handleExportEmails} type="button">
                                 <Download size={16} className="btn-icon-space" />
                                 导出邮箱
                             </button>
